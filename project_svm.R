@@ -124,5 +124,38 @@ best_model <- tuned$best.model
 
 
 
+# struggling with accuracy below
+### predicting for mornings in march
+morning_data <- test[test$Time_of_Day == "Night", ]
+#more_pred <- predict(svm_lin, newdata = morning_data)
+march_data <- morning_data[morning_data$Month_name == "Jun", ]
+
+march_lin <- predict(svm_lin, newdata = march_data)
+summary(march_lin)
+
+march_pol <- predict(svm_pol, newdata = march_data)
+summary(march_pol)
+
+march_rad <- predict(svm_rad, newdata = march_data)
+summary(march_rad)
+
+march_sig <- predict(svm_sig, newdata = march_data)
+summary(march_sig)
+
+
+
+# including cost
+morning_data <- test[test$Time_of_Day == "Afternoon", ]
+large_data <- morning_data[morning_data$money <25 , ]
+large_lin <- predict(svm_pol, newdata=large_data)
+summary(large_lin)
+
+# plot one type over a year
+esp_data <- data[data$coffee_name == "Cocoa", ]
+plot(esp_data$Monthsort, esp_data$money)
+# plot other coffees over year
+
+
+
 
 
