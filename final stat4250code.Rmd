@@ -1,0 +1,631 @@
+---
+title: "Final Project Stat 4250"
+author: "Emily Zapata"
+date: "2025-11-12"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5)
+
+library(tidyverse)
+library(janitor)
+library(scales)
+library(class)
+library(rpart)
+library(rsample)
+library(recipes)
+library(MASS)       
+library(e1071)    
+library(glmnet)
+library(pROC) 
+theme_set(theme_minimal(base_size = 12))
+set.seed(42)
+```
+
+
+```{r}
+
+raw = readr::read_csv("Coffe_sales.csv", show_col_types = FALSE) %>%
+  janitor::clean_names()
+names(raw)
+
+df = raw %>%
+  dplyr::select(tidyselect::any_of(c(
+    "hour_of_day",   # numeric hour
+    "cash_type",     # card / cash
+    "money",         # purchase amount
+    "coffee_name",   # drink label
+    "time_of_day",   # Morning/Afternoon/Evening
+    "weekday",       # day of week
+    "month_name",    # month string
+    "date",          # transaction date
+    "time"           # exact purchase time
+  ))) %>%
+  tidyr::drop_na() %>%
+  dplyr::mutate(
+    #categorical variables to factors
+    dplyr::across(c(cash_type, coffee_name, time_of_day, weekday, month_name), as.factor),
+  
+    hour_of_day = as.numeric(hour_of_day),
+    money       = as.numeric(money),
+  
+    date        = as.Date(date),
+    time        = as.POSIXct(time, format = "%H:%M:%OS", tz = "UTC")
+  )
+
+glimpse(df)
+
+
+```
+
+
+
+
+2. This section gets the data ready for machine learning models
+The dataset is split into a training set (70%) and a test set (30%).
+
+```{r}
+set.seed(42)
+stopifnot(exists("df"), is.data.frame(df), "coffee_name" %in% names(df))
+
+split = initial_split(df, prop = 0.7, strata = "coffee_name")
+trn = training(split)
+tst = testing(split)
+
+cat("# rows — train:", nrow(trn), " | test:", nrow(tst), "\n\n")
+
+#balance in train/test
+cat("Train class counts:\n")
+print(dplyr::count(trn, coffee_name))
+cat("\nTest class counts:\n")
+print(dplyr::count(tst, coffee_name))
+
+#ZV -> dummies -> scale
+rec_base = recipe(coffee_name ~ hour_of_day + cash_type + money +
+                     time_of_day + weekday + month_name, data = trn) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_predictors())
+
+prep_base = prep(rec_base, verbose = TRUE)
+
+x_trn = bake(prep_base, trn) %>% dplyr::select(-coffee_name)
+y_trn = trn$coffee_name
+x_tst = bake(prep_base, tst) %>% dplyr::select(-coffee_name)
+y_tst = tst$coffee_name
+
+cat("\nDesign matrix dimensions:\n")
+cat("x_trn:", paste(dim(x_trn), collapse = " x "), "\n")
+cat("x_tst:", paste(dim(x_tst), collapse = " x "), "\n\n")
+
+cat("First 5 columns of x_trn:\n")
+print(head(x_trn[, 1:min(5, ncol(x_trn))]))
+```
+first table is the data set with all transactions 
+second table is testing set (tst) the 30% subset- used to evaluate the model after trainig 
+
+
+
+3. LDA classied the cofee types based on the predictors.
+0bserved: uses proporttions from your training dat 
+uniform: assumes all coffee types are equally common 
+skewed pretend the most popular drink (ex: americano with milk) dominated 80% of the sales 
+
+```{r}
+obs_priors = prop.table(table(y_trn)) |> as.numeric()
+
+#uniform classes 
+uni_priors <- rep(1 / length(levels(y_trn)), length(levels(y_trn)))
+
+#skewed: favoring the most common drink
+skw_priors = replace(uni_priors, which.max(obs_priors), 0.8)
+skw_priors = skw_priors / sum(skw_priors)
+
+#combine priors into list
+priors_list = list(
+  Observed = obs_priors,
+  Uniform = uni_priors,
+  Skewed = skw_priors
+)
+
+#LDA models with different priors
+lda_results = map_df(names(priors_list), function(pr_name) {
+  lda_fit = lda(x = x_trn, grouping = y_trn, prior = priors_list[[pr_name]])
+  pred = predict(lda_fit, x_tst)$class
+  tibble(
+    Setting = pr_name,
+    Accuracy = mean(pred == y_tst)
+  )
+})
+
+#numeric accuracy output
+lda_results
+
+#comparing LDA accuracies
+ggplot(lda_results, aes(x = Setting, y = Accuracy, fill = Setting)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = percent(Accuracy, 0.1)), vjust = -0.5, size = 3.5) +
+  ylim(0, 1) +
+  labs(title = "LDA Accuracy under Different Prior Settings",
+       x = "Prior Type",
+       y = "Accuracy (Test Set)") +
+  theme_minimal(base_size = 13)
+```
+observed prior 63.4% accuracy:
+americano with milk and latte are the most common 
+espresso and cocoa are rare 
+
+uniform prior 58.8% accuracy:
+the model assumes every coffee type is equally likely, even though the dataset is imbalanced 
+the model overpredicts rare drinks 
+underpredicts common drinks 
+
+Sweked prior 58.9% accuracy:
+So the model heavily overpredicts the most popular drink
+Completely underpredicts the rest
+
+Because our dataset contains imbalanced coffee categories, LDA performs best when the prior probabilities match the actual class frequencies. When priors are artificially changed (uniform or skewed), classification accuracy decreases by about 4–5%. This demonstrates moderate sensitivity of LDA to class priors
+
+
+4. random partition experiment (30replications) 
+```{r}
+set.seed(10)
+
+n_reps = 30
+mis_list = numeric(n_reps)
+
+for (i in 1:n_reps) {
+
+ 
+  split_i = initial_split(df, prop = 50/150)  # ≈ 0.333
+  trn_i = training(split_i)
+  tst_i = testing(split_i)
+
+  #dummy + scale + zero-variance removal
+  rec_i = recipe(coffee_name ~ hour_of_day + cash_type + money +
+                    time_of_day + weekday + month_name, data = trn_i) %>%
+    step_zv(all_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+    step_normalize(all_predictors())
+
+  prep_i = prep(rec_i)
+
+  x_tr = bake(prep_i, trn_i) %>% dplyr::select(-coffee_name)
+  y_tr = trn_i$coffee_name
+
+  x_ts = bake(prep_i, tst_i) %>% dplyr::select(-coffee_name)
+  y_ts = tst_i$coffee_name
+
+  #LDA
+  uni_priors = rep(1/length(levels(y_tr)), length(levels(y_tr)))
+
+  lda_fit = lda(x = x_tr, grouping = y_tr, prior = uni_priors)
+
+  #Predict
+  pred_ts = predict(lda_fit, x_ts)$class
+
+  #misclassifications
+  mis_list[i] = sum(pred_ts != y_ts)
+}
+
+mis_df = tibble(
+  Replication = 1:n_reps,
+  Misclassifications = mis_list
+)
+
+head(mis_df)
+
+#Histogram
+ggplot(mis_df, aes(Misclassifications)) +
+  geom_histogram(binwidth = 2, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of LDA Misclassifications (30 Random Splits)",
+       x = "Number of Misclassifications",
+       y = "Frequency") +
+  theme_minimal(base_size = 14)
+```
+
+the random train/test split experiment 30 times, each time training LDA on only 50 observations and testing on ~1,050. The number of misclassifications per replication ranged approximately from 970 to 1,060. The histogram shows that most values concentrate around 1,000, indicating that LDA performance is relatively stable across random partitions, even though overall accuracy is low due to the small training sample size and the multiclass nature of the problem.
+
+
+5. binary classification LDA vs SVM
+create a binary classification (Can we tell whether someone ordered a Latte vs any other drink?)
+reduces noise 
+
+```{r}
+set.seed(123)
+
+#binary Latte vs Other
+df_bin = df %>%
+  dplyr::mutate(
+    coffee_binary = ifelse(coffee_name == "Latte", "Latte", "Other"),
+    coffee_binary = factor(coffee_binary)
+  )
+
+#Train/test split (50/50) 
+split_bin = initial_split(df_bin, prop = 0.5, strata = "coffee_binary")
+trn_bin = training(split_bin)
+tst_bin = testing(split_bin)
+
+rec_bin = recipe(coffee_binary ~ hour_of_day + money + time_of_day +
+                    weekday + month_name,
+                  data = trn_bin) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_predictors())
+
+prep_bin = prep(rec_bin)
+
+#train/test, split into X and y
+bake_tr = bake(prep_bin, new_data = trn_bin)
+x_tr_b  = bake_tr %>% dplyr::select(-coffee_binary)
+y_tr_b  = bake_tr$coffee_binary
+
+bake_ts = bake(prep_bin, new_data = tst_bin)
+x_ts_b  = bake_ts %>% dplyr::select(-coffee_binary)
+y_ts_b  = bake_ts$coffee_binary
+
+#LDA
+lda_bin  = MASS::lda(x = x_tr_b, grouping = y_tr_b)
+lda_pred = predict(lda_bin, x_ts_b)$class
+lda_acc  = mean(lda_pred == y_ts_b)
+
+#SVM (linear)
+svm_bin  = e1071::svm(x = x_tr_b, y = y_tr_b, kernel = "linear", scale = FALSE)
+svm_pred = predict(svm_bin, x_ts_b)
+svm_acc  = mean(svm_pred == y_ts_b)
+
+#comparison table
+acc_bin = tibble(
+  Model    = c("LDA", "SVM (linear)"),
+  Accuracy = c(lda_acc, svm_acc)
+)
+
+print(acc_bin)
+
+#barplot
+ggplot(acc_bin, aes(Model, Accuracy, fill = Model)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(Accuracy, 0.1)), vjust = -0.5) +
+  ylim(0, 1) +
+  labs(title = "Binary Classification: Latte vs Other",
+       x = NULL,
+       y = "Accuracy (Test Set)") +
+  theme_minimal(base_size = 14)
+
+#confusion matrices 
+cat("\nLDA confusion matrix:\n")
+print(caret::confusionMatrix(lda_pred, y_ts_b))
+
+cat("\nSVM confusion matrix:\n")
+print(caret::confusionMatrix(svm_pred, y_ts_b))
+```
+1. confusion matrix:  116 = true positives (latter correctly identified as lattes)
+122 = false positives (predicted latte, but actually other)
+263 = false negatove (actual latter incorrectly predicted as other)
+1273 = true negatives (correctly predicted as other)
+
+
+Accuracy = 78.3% overall the model correctly predicts latter vs other 78% of the time 
+Sensitivity = 30.6% "how good is the model at detecting actual lattes? low, the model is very good at recognizing non-latte drinks 
+Specific = 91.3% "how good is is at detecting "other" drinks?" high, the model is very good at recognizing non-latte drinks 
+Positive Predictive Value = 48.7% When the model predicts “Latte,” it is correct only half the time.
+
+
+2. accuracy table: 
+
+both models perfom almost the same (<0.5% difference)
+LDA is slightly higher in raw accuracy, but the margin is small
+
+
+3. bar plot 
+LDA ≈ 78.7% accuracy
+SVM ≈ 78.3% accuracy
+Both models perform almost identically in binary classification
+
+
+Overall, SVM and LDA perform similarly, but neither model is highly effective at detecting Latte purchase
+
+
+6. lasso - ridge - elastic net 
+We will use these predictors: hour_of_day, money, time_of_day, weekday, month_name
+
+We applied penalized multinomial logistic regression using LASSO, Ridge, and Elastic Net regularization to predict the coffee type (8 classes) from hour of day, time of day, weekday, month, and price.
+
+```{r}
+set.seed(123)
+
+#Train/test split (same as 2)
+split = initial_split(df, prop = 0.7, strata = coffee_name)
+trn = training(split)
+tst = testing(split)
+
+#dummy variables + normalization
+rec_glm = recipe(coffee_name ~ hour_of_day + money + time_of_day +
+                    weekday + month_name, data = trn) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_predictors())
+
+prep_glm = prep(rec_glm)
+
+#training matrices
+train_mat = bake(prep_glm, trn)
+
+x_train = train_mat %>%
+  dplyr::select(-coffee_name) %>%
+  as.matrix()
+
+y_train = train_mat$coffee_name
+
+#testing matrices
+test_mat = bake(prep_glm, tst)
+
+x_test = test_mat %>%
+  dplyr::select(-coffee_name) %>%
+  as.matrix()
+
+y_test = test_mat$coffee_name
+#LASSO (alpha = 1)
+lasso_fit = glmnet(
+  x = x_train,
+  y = y_train,
+  family = "multinomial",
+  alpha = 1
+)
+
+#RIDGE (alpha = 0)
+ridge_fit = glmnet(
+  x = x_train,
+  y = y_train,
+  family = "multinomial",
+  alpha = 0
+)
+
+#Elastic Net (alpha = 0.5)
+enet_fit = glmnet(
+  x = x_train,
+  y = y_train,
+  family = "multinomial",
+  alpha = 0.5
+)
+
+glmnet_accuracy = function(model, x_test, y_test) {
+  preds = predict(model, x_test, type = "class")
+  mean(preds == y_test)
+}
+
+#accuracies
+acc_lasso = glmnet_accuracy(lasso_fit, x_test, y_test)
+acc_ridge = glmnet_accuracy(ridge_fit, x_test, y_test)
+acc_enet  = glmnet_accuracy(enet_fit, x_test, y_test)
+
+acc_glmnet = tibble(
+  Model = c("LASSO", "Ridge", "Elastic Net"),
+  Accuracy = c(acc_lasso, acc_ridge, acc_enet)
+)
+
+print(acc_glmnet)
+
+#bar plot
+ggplot(acc_glmnet, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(Accuracy, 0.1)), vjust = -0.5) +
+  ylim(0, 1) +
+  labs(title = "Penalized Regression: Multiclass Coffee Prediction",
+       y = "Accuracy (Test Set)",
+       x = "") +
+  theme_minimal(base_size = 14)
+```
+
+1. accuracy table: lasso and elastic net perform almost the same (~59%) 
+these models shrink coefficients, remove irrelevant predictors, handle correlated dummy variables well. 
+The LASSO and Elastic Net models are able to find meaningful patterns among these predictors to classify coffee type moderately well.
+
+ridge performs worse (37.5%)
+Ridge shrinks all coefficients, but never removes any
+big drop in accuracy is expected in datasets with many categorical predictors.
+
+Accuracy plot: 
+It clearly highlights the performance gap
+
+This indicates that variable selection is important in this dataset.
+Because our predictors are heavily categorical and represented through many dummy variables, LASSO and Elastic Net are better suited for identifying the most relevant features. Ridge, which only shrinks coefficients but does not select among them, distributes weight across many weak predictors and consequently performs much worse.
+
+Overall, penalized regression models perform moderately well, but LDA and SVM (from earlier steps) remain stronger classifiers for this dataset.
+
+
+7. Identify the most important predictors for coffee type
+What variables influence what type of coffee people order?
+
+We use penalized regression here because your dataset has many predictors created from dummy-coding (time of day, month, weekday, payment type, etc.), which makes the model more complex than it looks at first glance. When a model has many correlated predictors, like Morning/Afternoon/Night indicators or months of the year, it becomes easy for logistic regression to overfit the training data and give unstable or extreme coefficients. Penalized models solve this by shrinking coefficients toward zero, which forces the model to use only the strongest, most stable relationships between the predictors and the coffee type.
+
+```{r}
+coef_to_tibble_multinomial = function(coef_list, model_name) {
+  purrr::map_dfr(names(coef_list), function(class_name) {
+    mat = as.matrix(coef_list[[class_name]])
+    tibble(
+      coffee_class = class_name,
+      feature = rownames(mat),
+      coefficient = mat[, ncol(mat)],   #last lambda coefficients
+      Model = model_name
+    )
+  })
+}
+
+lasso_coefs = coef(lasso_fit)
+ridge_coefs = coef(ridge_fit)
+enet_coefs  = coef(enet_fit)
+
+
+lasso_tbl = coef_to_tibble_multinomial(lasso_coefs, "LASSO")
+ridge_tbl = coef_to_tibble_multinomial(ridge_coefs, "Ridge")
+enet_tbl = coef_to_tibble_multinomial(enet_coefs,  "Elastic Net")
+
+coef_all =bind_rows(lasso_tbl, ridge_tbl, enet_tbl)
+
+coef_all = coef_all %>% filter(feature != "(Intercept)")
+
+top_predictors = coef_all %>%
+  mutate(abs_coef = abs(coefficient)) %>%
+  group_by(Model) %>%
+  slice_max(abs_coef, n = 10) %>%
+  ungroup()
+
+top_predictors
+
+#Plot
+ggplot(top_predictors,
+       aes(x = reorder(feature, abs_coef), y = abs_coef, fill = Model)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Top 10 Most Important Predictors (Penalized Models)",
+       x = "Feature",
+       y = "Importance (|Coefficient|)") +
+  theme_minimal(base_size = 14)
+```
+the variable money: the price of the drink, is the most influential factor across almost every category of coffee.
+Drinks such as Espresso, Americano, Cappuccino, Latte, and Cocoa all have large positive or negative coefficients attached to the “money” variable, meaning that price plays a major role in distinguishing one drink from another. More expensive drinks, like lattes or cappuccinos, tend to be associated with positive coefficients, while cheaper drinks often show negative ones.
+
+The table also includes one month-based predictor, month_name_Aug, which Elastic Net assigned a meaningful coefficient because the patterns of purchases in August differed enough to help the model separate certain classes.
+
+The presence of month_name_Aug in the results indicates that at least one of the coffee classes had a unique or unusual pattern of purchases during August.
+
+
+8. Can we predict whether someone buys a hot drink (“Hot”) or cold drink (“Cold”) just from the time of day?
+
+```{r}
+set.seed(99)
+
+#Hot vs Cold
+
+hot_drinks  = c("Latte", "Cappuccino", "Americano", "Espresso", "Cortado", "Mocha")
+cold_drinks = c("Cold Brew", "Iced Latte", "Iced Americano", "Frappuccino")
+
+df_easy = df %>%
+  mutate(
+    hotcold = ifelse(coffee_name %in% hot_drinks, "Hot", "Cold"),
+    hotcold = factor(hotcold)
+  )
+
+#Train/test split (70/30)
+split_easy = initial_split(df_easy, prop = 0.7, strata = hotcold)
+trn_easy = training(split_easy)
+tst_easy = testing(split_easy)
+
+#ONLY hour_of_day
+rec_easy = recipe(hotcold ~ hour_of_day, data = trn_easy) %>%
+  step_normalize(all_predictors())
+
+prep_easy = prep(rec_easy)
+#train/test sets
+train_easy = bake(prep_easy, trn_easy)
+test_easy  = bake(prep_easy, tst_easy)
+
+x_tr_easy = train_easy %>% dplyr::select(hour_of_day)
+y_tr_easy = trn_easy$hotcold
+
+x_ts_easy = test_easy %>% dplyr::select(hour_of_day)
+y_ts_easy = tst_easy$hotcold
+#LDA
+lda_easy = lda(x = x_tr_easy, grouping = y_tr_easy)
+lda_pred = predict(lda_easy, x_ts_easy)$class
+lda_acc = mean(lda_pred == y_ts_easy)
+
+#kNN (k=5)
+knn_pred = knn(train = x_tr_easy,
+                test  = x_ts_easy,
+                cl    = y_tr_easy,
+                k = 5)
+knn_acc = mean(knn_pred == y_ts_easy)
+
+
+acc_easy = tibble(
+  Model = c("LDA", "kNN (k=5)"),
+  Accuracy = c(lda_acc, knn_acc)
+)
+
+print(acc_easy)
+
+#Plot
+ggplot(acc_easy, aes(Model, Accuracy, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = percent(Accuracy, 0.1)), vjust = -0.5) +
+  ylim(0, 1) +
+  labs(title = "Hot vs Cold",
+       y = "Accuracy",
+       x = "") +
+  theme_minimal(base_size = 14)
+
+```
+The intuition is that customers tend to prefer hot drinks earlier in the morning and cold drinks later in the day, so time alone may contain some predictive information.
+
+We fit two very simple models: Linear Discriminant Analysis (LDA) and k-Nearest Neighbors (k = 5). These models make different assumptions: LDA assumes linear separation between classes, while kNN classifies based on the majority vote of nearby observations.
+
+The results show that both models achieved approximately 62.6% accuracy on the test set. The identical accuracy indicates that the relationship between time of day and drink temperature preference is real but not overwhelmingly strong
+
+
+
+9. We want to see whether the price of a drink (money) helps predict when it is bought.
+Some drinks (like lattes and cappuccinos) are more expensive and often bought early in the day
+predictor: money 
+logistic regression and decision tree
+
+```{r}
+df_time = df %>%
+  mutate(
+    time_binary = ifelse(time_of_day == "Morning", "Morning", "Later"),
+    time_binary = factor(time_binary)
+  )
+
+#Train/test split
+split_time = initial_split(df_time, prop = 0.7, strata = time_binary)
+trn_time = training(split_time)
+tst_time = testing(split_time)
+
+rec_time = recipe(time_binary ~ money, data = trn_time) %>%
+  step_normalize(all_predictors())
+
+prep_time = prep(rec_time)
+x_tr_time = bake(prep_time, trn_time)
+x_ts_time = bake(prep_time, tst_time)
+
+#Logistic Regression
+log_time = glm(time_binary ~ money, data = x_tr_time, family = binomial)
+log_preds = ifelse(predict(log_time, x_ts_time, type = "response") > 0.5, "Morning", "Later")
+log_acc = mean(log_preds == tst_time$time_binary)
+
+#Decision Tree
+tree_time = rpart(time_binary ~ money, data = x_tr_time)
+tree_preds = predict(tree_time, x_ts_time, type = "class")
+tree_acc = mean(tree_preds == tst_time$time_binary)
+
+#Accuracy table
+acc_time =tibble(
+  Model = c("Logistic Regression", "Decision Tree"),
+  Accuracy = c(log_acc, tree_acc)
+)
+
+print(acc_time)
+
+#Plot
+ggplot(acc_time, aes(Model, Accuracy, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = percent(Accuracy, 0.1)), vjust = -0.5) +
+  ylim(0, 1) +
+  labs(
+    title = "Predicting Time of Day From Price",
+    y = "Accuracy",
+    x = ""
+  ) +
+  theme_minimal(base_size = 14)
+```
+Logistic Regression, which models the probability of “Morning” using a smooth curve
+Decision Tree, which splits the price range into simple thresholds
+
+both models achieved the same test accuracy: 66.7%. This means that using price alone, our models correctly predicted the time-of-day category about two-thirds of the time. Although this is not perfect, it is noticeably better than a naive 50–50 guess, which suggests that price does contain meaningful information about when drinks are purchased.
+
+
+
