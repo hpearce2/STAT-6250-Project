@@ -1,8 +1,9 @@
 library(lubridate)
-library(dplyr)
 library(tidyverse)
 library(MASS)
 library(scales)
+library(rsample)
+library(recipes)
 
 data <- read.csv("Coffe_sales.csv")
 
@@ -106,3 +107,48 @@ ggplot(lda_results, aes(x = Setting, y = Accuracy, fill = Setting)) +
        y = "Accuracy (Test Set)") +
   theme_minimal(base_size = 13)
 
+
+
+# random partition experiment
+set.seed(10)
+
+n_reps = 30
+mis_list = numeric(n_reps)
+
+for (i in 1:n_reps) {
+  
+  # split
+  train_index <- sample(1:nrow(model_data), 0.7*nrow(model_data))
+  train_i <- model_data[train_index, ]
+  test_i <- model_data[-train_index, ]
+  
+  #scale numeric values
+  num_cols <- c("hour_of_day", "money")
+  train_i[, num_cols] <- scale(train_i[, num_cols])
+  test_i[, num_cols] <- scale(test_i[, num_cols])
+  
+  # fit model
+  lda_fit = lda(coffee_name ~ money + Time_of_Day* Month_name, data= train_i)
+  
+  #predict
+  pred_i = predict(lda_fit, test_i)$class
+  
+  # misclassifications
+  mis_list[i] = sum(pred_i != test_i$coffee_name)
+  #mis_list[i] = mean(pred_i == test_i$coffee_name) to get accuracy
+}
+
+mis_df = tibble(
+  Replication = 1:n_reps,
+  Misclassifications = mis_list
+)
+
+head(mis_df)
+
+# histogram
+ggplot(mis_df, aes(Misclassifications)) +
+  geom_histogram(binwidth = 2, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of LDA Misclassifications (30 Random Splits)",
+       x = "Number of Misclassifications",
+       y = "Frequency") +
+  theme_minimal(base_size = 14)
