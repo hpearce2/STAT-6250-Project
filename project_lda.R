@@ -2,6 +2,7 @@ library(lubridate)
 library(dplyr)
 library(tidyverse)
 library(MASS)
+library(scales)
 
 data <- read.csv("Coffe_sales.csv")
 
@@ -92,4 +93,16 @@ lda_results = map_df(names(priors_list), function(pr_name) {
 
 #numeric accuracy output
 lda_results
+
+
+
+#comparing LDA accuracies
+ggplot(lda_results, aes(x = Setting, y = Accuracy, fill = Setting)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = percent(Accuracy, 0.1)), vjust = -0.5, size = 3.5) +
+  ylim(0, 1) +
+  labs(title = "LDA Accuracy under Different Prior Settings",
+       x = "Prior Type",
+       y = "Accuracy (Test Set)") +
+  theme_minimal(base_size = 13)
 
